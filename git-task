@@ -1,0 +1,432 @@
+#!/bin/bash
+set -euo pipefail
+
+# git-task: APFS clone-based git workflow manager
+# Enables multiple simultaneous workspaces with copy-on-write efficiency
+
+VERSION="0.1.0"
+
+# Detect OS and set clone command
+if [[ "$(uname)" == "Darwin" ]]; then
+    # macOS: use APFS clone (copy-on-write)
+    clone_cp() { cp -Rc "$1" "$2"; }
+else
+    # Linux: try reflink (btrfs/xfs), fall back to regular copy
+    clone_cp() { cp -R --reflink=auto "$1" "$2" 2>/dev/null || cp -R "$1" "$2"; }
+fi
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+# Configuration
+CONFIG_FILE="$HOME/.git-task"
+TASKS_SUFFIX="-tasks"
+
+#######################################
+# Helpers
+#######################################
+
+log_info() { echo -e "${BLUE}→${NC} $1"; }
+log_success() { echo -e "${GREEN}✓${NC} $1"; }
+log_warn() { echo -e "${YELLOW}!${NC} $1"; }
+log_error() { echo -e "${RED}✗${NC} $1" >&2; }
+
+die() { log_error "$1"; exit 1; }
+
+# Get the base repo path (strips -tasks/<task> if we're in a task dir)
+get_base_repo() {
+    local cwd="${1:-$(pwd)}"
+    [[ -z "$cwd" ]] && cwd=$(pwd)
+    local resolved
+
+    # Always resolve to physical path first
+    resolved=$(cd "$cwd" 2>/dev/null && pwd -P) || resolved="$cwd"
+
+    # Check if physical path is in a task directory
+    if [[ "$resolved" =~ ^(.+)${TASKS_SUFFIX}/[^/]+(/.*)?$ ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return 0
+    fi
+
+    # Check if we're in the -tasks directory itself
+    if [[ "$resolved" =~ ^(.+)${TASKS_SUFFIX}$ ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return 0
+    fi
+
+    # Not in a task structure - return as-is
+    echo "$cwd"
+}
+
+get_tasks_dir() {
+    local base=$(get_base_repo "${1:-}")
+    echo "${base}${TASKS_SUFFIX}"
+}
+
+get_current_task() {
+    local base=$(get_base_repo)
+    local symlink="$base"
+
+    if [[ -L "$symlink" ]]; then
+        local target=$(readlink "$symlink")
+        if [[ "$target" =~ ${TASKS_SUFFIX}/([^/]+)$ ]]; then
+            echo "${BASH_REMATCH[1]}"
+            return 0
+        fi
+    fi
+
+    # Check if we're directly in a task directory
+    local cwd=$(pwd -P)
+    if [[ "$cwd" =~ ${TASKS_SUFFIX}/([^/]+)(/.*)?$ ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return 0
+    fi
+
+    return 1
+}
+
+ensure_git_repo() {
+    git rev-parse --git-dir > /dev/null 2>&1 || die "Not in a git repository"
+}
+
+#######################################
+# Commands
+#######################################
+
+cmd_init() {
+    local repo_path="${1:-$(pwd)}"
+    repo_path=$(cd "$repo_path" && pwd)
+
+    [[ -d "$repo_path/.git" ]] || die "Not a git repository: $repo_path"
+
+    local tasks_dir="${repo_path}${TASKS_SUFFIX}"
+
+    if [[ -d "$tasks_dir" ]]; then
+        log_warn "Tasks directory already exists: $tasks_dir"
+        return 0
+    fi
+
+    mkdir -p "$tasks_dir"
+    log_success "Initialized git-task at $tasks_dir"
+
+    # Create base task from current state
+    log_info "Creating 'main' task from current repo..."
+
+    # Move repo to tasks dir
+    local main_task="$tasks_dir/main"
+    clone_cp "$repo_path" "$main_task"  # CoW clone (APFS on macOS, reflink on Linux)
+
+    # Clear original and make symlink
+    local repo_name=$(basename "$repo_path")
+    local parent_dir=$(dirname "$repo_path")
+
+    # Remove contents of original (keeping tasks dir reference)
+    find "$repo_path" -mindepth 1 -maxdepth 1 ! -name "*${TASKS_SUFFIX}" -exec rm -rf {} +
+
+    # Convert original to symlink
+    rm -rf "$repo_path"
+    ln -s "$main_task" "$repo_path"
+
+    log_success "Created 'main' task and linked $repo_path → $main_task"
+    echo ""
+    log_info "Your repo is now managed by git-task!"
+    log_info "  Active task: main"
+    log_info "  Tasks dir:   $tasks_dir"
+}
+
+cmd_new() {
+    local task_name="${1:-}"
+    local base_task="${2:-}"
+
+    [[ -n "$task_name" ]] || die "Usage: git task new <name> [base-task]"
+    [[ "$task_name" =~ ^[a-zA-Z0-9_-]+$ ]] || die "Task name must be alphanumeric with dashes/underscores"
+
+    local base=$(get_base_repo)
+    local tasks_dir=$(get_tasks_dir)
+    local new_task_path="$tasks_dir/$task_name"
+
+    [[ -d "$tasks_dir" ]] || die "Not initialized. Run 'git task init' first."
+    [[ ! -d "$new_task_path" ]] || die "Task '$task_name' already exists"
+
+    # Determine source for clone
+    local source_path
+    if [[ -n "$base_task" ]]; then
+        source_path="$tasks_dir/$base_task"
+        [[ -d "$source_path" ]] || die "Base task '$base_task' does not exist"
+    else
+        # Use current task or main
+        local current=$(get_current_task || echo "main")
+        source_path="$tasks_dir/$current"
+    fi
+
+    log_info "Creating task '$task_name' from '$(basename "$source_path")'..."
+
+    # CoW clone (APFS on macOS, reflink on Linux)
+    clone_cp "$source_path" "$new_task_path"
+
+    # Create and checkout new branch
+    cd "$new_task_path"
+    local branch_name="task/$task_name"
+
+    if git show-ref --verify --quiet "refs/heads/$branch_name"; then
+        git checkout "$branch_name"
+        log_info "Checked out existing branch: $branch_name"
+    else
+        git checkout -b "$branch_name"
+        log_success "Created branch: $branch_name"
+    fi
+
+    log_success "Created task: $task_name"
+    log_info "  Path:   $new_task_path"
+    log_info "  Branch: $branch_name"
+    echo ""
+    log_info "Switch to it with: git task switch $task_name"
+    log_info "Or work directly in: $new_task_path"
+}
+
+cmd_switch() {
+    local task_name="${1:-}"
+
+    [[ -n "$task_name" ]] || die "Usage: git task switch <name>"
+
+    local base=$(get_base_repo)
+    local tasks_dir=$(get_tasks_dir)
+    local task_path="$tasks_dir/$task_name"
+
+    [[ -d "$task_path" ]] || die "Task '$task_name' does not exist"
+
+    # Update symlink
+    local symlink="$base"
+    rm -f "$symlink"
+    ln -s "$task_path" "$symlink"
+
+    log_success "Switched to task: $task_name"
+    log_info "  $symlink → $task_path"
+
+    # Show branch info
+    cd "$task_path"
+    local branch=$(git branch --show-current)
+    log_info "  Branch: $branch"
+}
+
+cmd_list() {
+    local base=$(get_base_repo)
+    local tasks_dir=$(get_tasks_dir)
+
+    [[ -d "$tasks_dir" ]] || die "Not initialized. Run 'git task init' first."
+
+    local current=$(get_current_task || echo "")
+
+    echo -e "${CYAN}Tasks:${NC}"
+    echo ""
+
+    for task_path in "$tasks_dir"/*/; do
+        [[ -d "$task_path" ]] || continue
+
+        local task_name=$(basename "$task_path")
+        cd "$task_path"
+
+        local branch=$(git branch --show-current 2>/dev/null || echo "detached")
+        local status=""
+
+        # Check for uncommitted changes
+        if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
+            status=" ${YELLOW}(modified)${NC}"
+        fi
+
+        # Check for unpushed commits
+        local unpushed=$(git log --oneline @{upstream}..HEAD 2>/dev/null | wc -l | tr -d ' ')
+        if [[ "$unpushed" -gt 0 ]]; then
+            status="${status} ${BLUE}(${unpushed} unpushed)${NC}"
+        fi
+
+        if [[ "$task_name" == "$current" ]]; then
+            echo -e "  ${GREEN}▶ $task_name${NC} [$branch]$status"
+        else
+            echo -e "    $task_name [$branch]$status"
+        fi
+    done
+    echo ""
+}
+
+cmd_status() {
+    local base=$(get_base_repo)
+    local tasks_dir=$(get_tasks_dir)
+    local current=$(get_current_task || echo "none")
+
+    echo -e "${CYAN}git-task status${NC}"
+    echo ""
+    echo "  Base path:    $base"
+    echo "  Tasks dir:    $tasks_dir"
+    echo "  Active task:  $current"
+    echo ""
+
+    # Disk usage
+    if command -v du &> /dev/null; then
+        local total_size=$(du -sh "$tasks_dir" 2>/dev/null | cut -f1)
+        echo "  Total size:   $total_size"
+    fi
+}
+
+cmd_destroy() {
+    local task_name="${1:-}"
+    local force="${2:-}"
+
+    [[ -n "$task_name" ]] || die "Usage: git task destroy <name> [--force]"
+    [[ "$task_name" != "main" ]] || die "Cannot destroy 'main' task"
+
+    local base=$(get_base_repo)
+    local tasks_dir=$(get_tasks_dir)
+    local task_path="$tasks_dir/$task_name"
+
+    [[ -d "$task_path" ]] || die "Task '$task_name' does not exist"
+
+    local current=$(get_current_task || echo "")
+
+    # Check for uncommitted changes
+    cd "$task_path"
+    if [[ "$force" != "--force" ]] && [[ "$force" != "-f" ]]; then
+        if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
+            die "Task has uncommitted changes. Use --force to destroy anyway."
+        fi
+
+        local unpushed=$(git log --oneline @{upstream}..HEAD 2>/dev/null | wc -l | tr -d ' ')
+        if [[ "$unpushed" -gt 0 ]]; then
+            die "Task has $unpushed unpushed commits. Use --force to destroy anyway."
+        fi
+    fi
+
+    # Switch away if this is current
+    if [[ "$task_name" == "$current" ]]; then
+        log_warn "Switching to 'main' before destroying current task"
+        cmd_switch "main"
+    fi
+
+    rm -rf "$task_path"
+    log_success "Destroyed task: $task_name"
+}
+
+cmd_push() {
+    ensure_git_repo
+
+    local branch=$(git branch --show-current)
+    local task=$(get_current_task || echo "unknown")
+
+    log_info "Pushing task '$task' (branch: $branch)..."
+
+    # Check if upstream exists
+    if git rev-parse --abbrev-ref --symbolic-full-name @{upstream} &>/dev/null; then
+        git push
+    else
+        log_info "No upstream set, pushing with -u origin $branch"
+        git push -u origin "$branch"
+    fi
+
+    log_success "Pushed!"
+}
+
+cmd_path() {
+    local task_name="${1:-}"
+    local tasks_dir=$(get_tasks_dir)
+
+    if [[ -n "$task_name" ]]; then
+        local task_path="$tasks_dir/$task_name"
+        [[ -d "$task_path" ]] || die "Task '$task_name' does not exist"
+        echo "$task_path"
+    else
+        local current=$(get_current_task) || die "No active task"
+        echo "$tasks_dir/$current"
+    fi
+}
+
+cmd_exec() {
+    local task_name="${1:-}"
+    shift || die "Usage: git task exec <name> <command...>"
+
+    local tasks_dir=$(get_tasks_dir)
+    local task_path="$tasks_dir/$task_name"
+
+    [[ -d "$task_path" ]] || die "Task '$task_name' does not exist"
+    [[ $# -gt 0 ]] || die "No command specified"
+
+    cd "$task_path"
+    exec "$@"
+}
+
+cmd_help() {
+    cat << EOF
+${CYAN}git-task${NC} v${VERSION} - APFS clone-based git workflow manager
+
+${YELLOW}USAGE${NC}
+    git task <command> [args]
+
+${YELLOW}COMMANDS${NC}
+    init [path]              Initialize git-task for a repository
+    new <name> [base]        Create a new task (APFS clone)
+    switch <name>            Switch active task (update symlink)
+    list                     List all tasks with status
+    status                   Show git-task status
+    destroy <name> [--force] Remove a task
+    push                     Push current task's branch
+    path [name]              Print path to task directory
+    exec <name> <cmd...>     Run command in task directory
+    help                     Show this help
+
+${YELLOW}EXAMPLES${NC}
+    # Initialize in current repo
+    git task init
+
+    # Create a new task for a feature
+    git task new auth-refactor
+
+    # Work on it in your IDE (via symlink)
+    git task switch auth-refactor
+
+    # Or run agent directly in task dir
+    git task exec auth-refactor claude "implement auth"
+
+    # Check status of all tasks
+    git task list
+
+    # Push when ready
+    git task push
+
+${YELLOW}HOW IT WORKS${NC}
+    git-task uses APFS clones (copy-on-write) to create instant,
+    space-efficient copies of your repo. Each task is a full git
+    repo on its own branch. A symlink at your original repo path
+    points to the active task, so your IDE and tools keep working.
+
+EOF
+}
+
+#######################################
+# Main
+#######################################
+
+main() {
+    local cmd="${1:-help}"
+    shift || true
+
+    case "$cmd" in
+        init)    cmd_init "$@" ;;
+        new|create|add)     cmd_new "$@" ;;
+        switch|checkout|sw) cmd_switch "$@" ;;
+        list|ls)            cmd_list "$@" ;;
+        status|st)          cmd_status "$@" ;;
+        destroy|rm|remove)  cmd_destroy "$@" ;;
+        push)               cmd_push "$@" ;;
+        path)               cmd_path "$@" ;;
+        exec|run)           cmd_exec "$@" ;;
+        help|--help|-h)     cmd_help ;;
+        version|--version|-v) echo "git-task v${VERSION}" ;;
+        *)                  die "Unknown command: $cmd. Run 'git task help' for usage." ;;
+    esac
+}
+
+main "$@"
