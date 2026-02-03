@@ -11,6 +11,112 @@ When working on multiple features or reviewing PRs, you often need separate work
 
 **git-task** creates instant clones using filesystem copy-on-write (APFS on macOS, reflink on Linux). Each task is a complete, independent git repo that only uses disk space for files you actually change.
 
+## Why not just use git worktree?
+
+git-task is not trying to replace `git worktree` for standard human-driven Git workflows.
+It exists because `git worktree` breaks down under a specific set of constraints that are increasingly common in agent-heavy, tooling-heavy, large-repo environments.
+
+**If none of the following apply to you, you should probably just use `git worktree`.**
+
+### The problem space git-task targets
+
+#### 1. Massive repositories
+
+In very large repos, creating multiple working directories is expensive:
+
+- `git worktree` shares Git objects, but fully materializes the working tree
+- Creating or switching worktrees can be slow and IO-heavy
+- Disk usage grows linearly with each worktree
+
+git-task uses copy-on-write (CoW) filesystem clones where supported (APFS, reflinks), meaning:
+
+- New tasks are created nearly instantly
+- Unchanged files are physically shared
+- Disk and IO costs scale with actual changes, not repo size
+
+#### 2. Parallel, isolated work (especially with agents)
+
+If you are running:
+
+- Multiple LLM agents
+- Short-lived experimental branches
+- Parallel automated workflows
+
+You need:
+
+- Independent working directories
+- Independent uncommitted state
+- No file-level contention
+- Fast spin-up and teardown
+
+While `git worktree` provides isolation, it assumes long-lived, manually managed directories.
+git-task is optimized for cheap, disposable, parallel environments.
+
+#### 3. Tooling that assumes a single, stable repo path
+
+Many tools implicitly assume:
+
+- One canonical repo root
+- Stable paths for caches, configs, IDEs, scripts, and build systems
+- That "the repo" does not move
+
+With `git worktree`:
+
+- Every worktree lives at a different path
+- Tooling often needs to be reconfigured or duplicated
+- IDEs and scripts frequently break or become awkward
+
+git-task keeps one stable repo path and switches tasks by changing what that path points to (via symlinks), so:
+
+- IDEs don't need reconfiguration
+- Scripts keep working
+- Tooling sees "the same repo" even as tasks change
+
+### How git-task is different from git worktree
+
+| Aspect | git worktree | git-task |
+|--------|--------------|----------|
+| Working directory | One per worktree | One logical path, many tasks |
+| Path stability | Changes per worktree | Always stable |
+| Disk usage | Full working tree per worktree | CoW / shared until modified |
+| Spin-up cost | Moderate to high (large repos) | Near-instant (CoW FS) |
+| Agent ergonomics | Manual, directory-aware | Agent-friendly, disposable |
+| Git-native | Yes | Uses Git + filesystem primitives |
+
+### When you should use git worktree
+
+- You want a standard, well-known Git workflow
+- You have a small-to-medium repo
+- You manually switch branches occasionally
+- You don't rely on tooling that assumes a single repo location
+
+### When git-task makes sense
+
+- You have a very large repo
+- You run many parallel tasks or agents
+- Your tooling assumes one stable repo path
+- You value throughput and ergonomics over convention
+- You're comfortable with a sharper, more opinionated tool
+
+### Design philosophy
+
+git-task is intentionally opinionated.
+
+It optimizes for:
+
+- Local developer throughput
+- Parallel experimentation
+- Agent-first workflows
+- Filesystem efficiency
+
+It trades off:
+
+- Strict Git orthodoxy
+- Cross-filesystem portability
+- Team-wide default safety
+
+**This is a power tool. Use it when the constraints justify it.**
+
 ## Installation
 
 ```bash
@@ -153,6 +259,60 @@ git task status
 | macOS (APFS) | `cp -Rc` | Native CoW, instant clones |
 | Linux (btrfs/xfs) | `cp --reflink=auto` | CoW if filesystem supports it |
 | Linux (ext4/other) | `cp -R` | Falls back to regular copy |
+
+### Linux / Ubuntu support
+
+git-task relies on copy-on-write (CoW) filesystem cloning to provide fast, disk-efficient task creation.
+
+On Linux, this means **your filesystem matters**.
+
+#### Recommended filesystems
+
+git-task works best on filesystems that support reflinks:
+
+- **Btrfs** - fully supported
+- **XFS** - must be created with `reflink=1`
+- **APFS** (macOS) - fully supported
+
+On these filesystems, tasks are created nearly instantly and unchanged files are physically shared until modified.
+
+#### ext4 and other non-CoW filesystems
+
+On ext4 (the default on many Ubuntu installs) and other non-CoW filesystems:
+
+- Tasks fall back to full directory copies
+- Disk usage grows linearly with each task
+- Task creation time scales with repository size
+
+git-task will still function correctly, but most performance and disk benefits are lost.
+**In these cases, `git worktree` may be a better choice.**
+
+#### How to check your filesystem
+
+```bash
+stat -f -c %T .
+```
+
+- `btrfs` → ideal
+- `xfs` → check reflink support
+- `ext2/ext3/ext4` → no CoW
+
+Or test reflinks directly:
+
+```bash
+cp --reflink=always file1 file2
+```
+
+If this fails, your filesystem does not support CoW cloning.
+
+#### Filesystem summary
+
+| Filesystem | Supported | Performance |
+|------------|-----------|-------------|
+| Btrfs | Yes | Excellent |
+| XFS (reflink=1) | Yes | Excellent |
+| ext4 | Functional | Slow (full copies) |
+| Others | Varies | Depends on reflink support |
 
 ## Limitations
 

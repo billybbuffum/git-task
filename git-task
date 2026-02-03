@@ -6,6 +6,55 @@ set -euo pipefail
 
 VERSION="0.1.0"
 
+# Clone mode detection
+COW_MODE=""
+COW_WARNED=""
+
+detect_cow_support() {
+    local test_dir="${1:-.}"
+
+    # Already detected
+    [[ -n "$COW_MODE" ]] && return 0
+
+    if [[ "$(uname)" == "Darwin" ]]; then
+        # macOS APFS always supports CoW
+        COW_MODE="cow"
+        return 0
+    fi
+
+    # Linux: test reflink support directly
+    local test_file=$(mktemp -p "$test_dir" .cow_test_XXXXXX 2>/dev/null)
+    if [[ -z "$test_file" ]]; then
+        COW_MODE="full-copy"
+        return 0
+    fi
+
+    local test_copy="${test_file}_copy"
+    if cp --reflink=always "$test_file" "$test_copy" 2>/dev/null; then
+        COW_MODE="cow"
+        rm -f "$test_file" "$test_copy"
+    else
+        COW_MODE="full-copy"
+        rm -f "$test_file" "$test_copy"
+    fi
+}
+
+warn_no_cow() {
+    [[ -n "$COW_WARNED" ]] && return 0
+    [[ "$COW_MODE" == "cow" ]] && return 0
+
+    local fs_type=""
+    if command -v stat &>/dev/null; then
+        fs_type=$(stat -f -c %T . 2>/dev/null || echo "unknown")
+    fi
+
+    log_warn "Filesystem ($fs_type) does not support copy-on-write."
+    log_warn "Falling back to full copies. Performance may be degraded."
+    log_warn "For best results, use btrfs, XFS (reflink=1), or consider git worktree."
+    echo ""
+    COW_WARNED="1"
+}
+
 # Detect OS and set clone command
 if [[ "$(uname)" == "Darwin" ]]; then
     # macOS: use APFS clone (copy-on-write)
@@ -110,6 +159,10 @@ cmd_init() {
         return 0
     fi
 
+    # Check CoW support before creating tasks
+    detect_cow_support "$repo_path"
+    warn_no_cow
+
     mkdir -p "$tasks_dir"
     log_success "Initialized git-task at $tasks_dir"
 
@@ -148,6 +201,10 @@ cmd_new() {
     local base=$(get_base_repo)
     local tasks_dir=$(get_tasks_dir)
     [[ -d "$tasks_dir" ]] || die "Not initialized. Run 'git task init' first."
+
+    # Check CoW support (warn once per session)
+    detect_cow_support "$tasks_dir"
+    warn_no_cow
 
     # Get source for clones (current task or main)
     local current=$(get_current_task || echo "main")
@@ -253,11 +310,22 @@ cmd_status() {
     local tasks_dir=$(get_tasks_dir)
     local current=$(get_current_task || echo "none")
 
+    # Detect CoW support for status display
+    detect_cow_support "$tasks_dir"
+
+    local cow_status
+    if [[ "$COW_MODE" == "cow" ]]; then
+        cow_status="${GREEN}enabled${NC}"
+    else
+        cow_status="${YELLOW}disabled (full copies)${NC}"
+    fi
+
     echo -e "${CYAN}git-task status${NC}"
     echo ""
     echo "  Base path:    $base"
     echo "  Tasks dir:    $tasks_dir"
     echo "  Active task:  $current"
+    echo -e "  Copy-on-write: $cow_status"
     echo ""
 
     # Disk usage
