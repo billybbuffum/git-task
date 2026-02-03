@@ -369,6 +369,133 @@ cmd_push() {
     log_success "Pushed!"
 }
 
+cmd_prune() {
+    local tasks_dir=$(get_tasks_dir)
+    [[ -d "$tasks_dir" ]] || die "Not initialized. Run 'git task init' first."
+
+    local current=$(get_current_task || echo "")
+
+    log_info "Fetching from origin..."
+    cd "$tasks_dir/main"
+    git fetch origin --prune
+
+    local pruned=0
+    for task_path in "$tasks_dir"/*/; do
+        [[ -d "$task_path" ]] || continue
+        local task_name=$(basename "$task_path")
+        [[ "$task_name" == "main" ]] && continue
+
+        cd "$task_path"
+        local branch=$(git branch --show-current 2>/dev/null)
+        [[ -n "$branch" ]] || continue
+
+        # Check if branch exists on remote or has been merged
+        if ! git show-ref --verify --quiet "refs/remotes/origin/$branch" 2>/dev/null; then
+            # Branch doesn't exist on remote - check if it was ever pushed
+            if git log --oneline "origin/main..$branch" 2>/dev/null | head -1 | grep -q .; then
+                # Has unpushed commits, skip
+                log_warn "Skipping $task_name: has unpushed commits"
+                continue
+            fi
+
+            # Safe to remove
+            if [[ "$task_name" == "$current" ]]; then
+                log_warn "Switching to 'main' before pruning current task"
+                cmd_switch "main"
+                current="main"
+            fi
+            rm -rf "$task_path"
+            log_success "Pruned: $task_name (branch $branch gone from remote)"
+            ((pruned++))
+        fi
+    done
+
+    if [[ $pruned -eq 0 ]]; then
+        log_info "No tasks to prune"
+    else
+        log_success "Pruned $pruned task(s)"
+    fi
+}
+
+cmd_clean() {
+    local force="${1:-}"
+    local tasks_dir=$(get_tasks_dir)
+    [[ -d "$tasks_dir" ]] || die "Not initialized. Run 'git task init' first."
+
+    local current=$(get_current_task || echo "")
+    local cleaned=0
+
+    for task_path in "$tasks_dir"/*/; do
+        [[ -d "$task_path" ]] || continue
+        local task_name=$(basename "$task_path")
+        [[ "$task_name" == "main" ]] && continue
+
+        # Check for uncommitted changes unless forced
+        if [[ "$force" != "--force" ]] && [[ "$force" != "-f" ]]; then
+            cd "$task_path"
+            if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
+                log_warn "Skipping $task_name: has uncommitted changes"
+                continue
+            fi
+            local unpushed=$(git log --oneline @{upstream}..HEAD 2>/dev/null | wc -l | tr -d ' ')
+            if [[ "$unpushed" -gt 0 ]]; then
+                log_warn "Skipping $task_name: has $unpushed unpushed commits"
+                continue
+            fi
+        fi
+
+        if [[ "$task_name" == "$current" ]]; then
+            cmd_switch "main"
+            current="main"
+        fi
+        rm -rf "$task_path"
+        log_success "Destroyed: $task_name"
+        ((cleaned++))
+    done
+
+    if [[ $cleaned -eq 0 ]]; then
+        log_info "No tasks to clean (only main remains)"
+    else
+        log_success "Cleaned $cleaned task(s)"
+    fi
+}
+
+cmd_sync() {
+    local tasks_dir=$(get_tasks_dir)
+    [[ -d "$tasks_dir" ]] || die "Not initialized. Run 'git task init' first."
+
+    log_info "Fetching latest from origin..."
+    cd "$tasks_dir/main"
+    git fetch origin
+
+    local default_branch=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')
+    [[ -n "$default_branch" ]] || default_branch="main"
+
+    for task_path in "$tasks_dir"/*/; do
+        [[ -d "$task_path" ]] || continue
+        local task_name=$(basename "$task_path")
+
+        cd "$task_path"
+        local branch=$(git branch --show-current 2>/dev/null)
+
+        # Check for uncommitted changes
+        if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
+            log_warn "Skipping $task_name: has uncommitted changes"
+            continue
+        fi
+
+        log_info "Syncing $task_name..."
+        if git rebase "origin/$default_branch" 2>/dev/null; then
+            log_success "Synced: $task_name"
+        else
+            git rebase --abort 2>/dev/null
+            log_warn "Rebase failed for $task_name (conflicts), skipped"
+        fi
+    done
+
+    log_success "Sync complete"
+}
+
 cmd_path() {
     local task_name="${1:-}"
     local tasks_dir=$(get_tasks_dir)
@@ -413,6 +540,9 @@ ${YELLOW}COMMANDS${NC}
     status                   Show git-task status
     destroy <name> [--force] Remove a task
     push                     Push current task's branch
+    prune                    Remove tasks with deleted/merged remote branches
+    clean [--force]          Remove all tasks except main
+    sync                     Rebase all tasks onto latest origin/main
     path [name]              Print path to task directory
     exec <name> <cmd...>     Run command in task directory
     help                     Show this help
@@ -425,10 +555,10 @@ ${YELLOW}EXAMPLES${NC}
     git task new feature/auth-refactor
 
     # Work on it in your IDE (via symlink)
-    git task switch auth-refactor
+    git task switch feature-auth-refactor
 
     # Or run agent directly in task dir
-    git task exec auth-refactor claude "implement auth"
+    git task exec feature-auth-refactor claude "implement auth"
 
     # Check status of all tasks
     git task list
@@ -462,6 +592,9 @@ main() {
         status|st)          cmd_status "$@" ;;
         destroy|rm|remove)  cmd_destroy "$@" ;;
         push)               cmd_push "$@" ;;
+        prune)              cmd_prune "$@" ;;
+        clean)              cmd_clean "$@" ;;
+        sync)               cmd_sync "$@" ;;
         path)               cmd_path "$@" ;;
         exec|run)           cmd_exec "$@" ;;
         help|--help|-h)     cmd_help ;;
