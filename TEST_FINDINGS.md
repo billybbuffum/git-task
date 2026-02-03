@@ -2,9 +2,9 @@
 
 ## Test Summary
 
-Comprehensive testing was performed on all commands and edge cases. The following issues were discovered.
+Comprehensive testing was performed on all commands and edge cases. The following issues were discovered and fixed.
 
-## Critical Bugs
+## Critical Bugs (FIXED)
 
 ### 1. Broken tasks created when git checkout fails
 
@@ -66,7 +66,7 @@ wait
 ln -sfn "$task_path" "$symlink"
 ```
 
-## Medium Bugs
+## Medium Bugs (FIXED)
 
 ### 4. `status` command doesn't verify initialization
 

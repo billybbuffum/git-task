@@ -211,6 +211,12 @@ cmd_new() {
     local source_path="$tasks_dir/$current"
 
     for branch_name in "$@"; do
+        # Validate branch name
+        if [[ -z "$branch_name" ]]; then
+            log_warn "Empty branch name, skipping"
+            continue
+        fi
+
         # Convert branch name to directory-safe task name (feature/foo -> feature-foo)
         local task_name="${branch_name//\//-}"
         local new_task_path="$tasks_dir/$task_name"
@@ -223,17 +229,34 @@ cmd_new() {
         log_info "Creating task '$task_name' from '$(basename "$source_path")'..."
 
         # CoW clone (APFS on macOS, reflink on Linux)
-        clone_cp "$source_path" "$new_task_path"
+        if ! clone_cp "$source_path" "$new_task_path"; then
+            log_error "Failed to clone task directory"
+            continue
+        fi
 
         # Create and checkout branch
         cd "$new_task_path"
 
+        local checkout_failed=""
         if git show-ref --verify --quiet "refs/heads/$branch_name"; then
-            git checkout "$branch_name"
-            log_info "Checked out existing branch: $branch_name"
+            if git checkout "$branch_name" 2>/dev/null; then
+                log_info "Checked out existing branch: $branch_name"
+            else
+                checkout_failed="1"
+            fi
         else
-            git checkout -b "$branch_name"
-            log_success "Created branch: $branch_name"
+            if git checkout -b "$branch_name" 2>/dev/null; then
+                log_success "Created branch: $branch_name"
+            else
+                checkout_failed="1"
+            fi
+        fi
+
+        # Clean up if checkout failed
+        if [[ -n "$checkout_failed" ]]; then
+            log_error "Failed to checkout branch '$branch_name' - cleaning up"
+            rm -rf "$new_task_path"
+            continue
         fi
 
         log_success "Created task: $task_name [$branch_name]"
@@ -251,10 +274,9 @@ cmd_switch() {
 
     [[ -d "$task_path" ]] || die "Task '$task_name' does not exist"
 
-    # Update symlink
+    # Update symlink atomically
     local symlink="$base"
-    rm -f "$symlink"
-    ln -s "$task_path" "$symlink"
+    ln -sfn "$task_path" "$symlink"
 
     log_success "Switched to task: $task_name"
     log_info "  $symlink → $task_path"
@@ -308,6 +330,9 @@ cmd_list() {
 cmd_status() {
     local base=$(get_base_repo)
     local tasks_dir=$(get_tasks_dir)
+
+    [[ -d "$tasks_dir" ]] || die "Not initialized. Run 'git task init' first."
+
     local current=$(get_current_task || echo "none")
 
     # Detect CoW support for status display
@@ -474,7 +499,7 @@ cmd_prune() {
             fi
             rm -rf "$task_path"
             log_success "Pruned: $task_name (branch $branch gone from remote)"
-            ((pruned++))
+            ((pruned++)) || true
         fi
     done
 
@@ -518,7 +543,7 @@ cmd_clean() {
         fi
         rm -rf "$task_path"
         log_success "Destroyed: $task_name"
-        ((cleaned++))
+        ((cleaned++)) || true
     done
 
     if [[ $cleaned -eq 0 ]]; then
@@ -614,7 +639,7 @@ cmd_doctor() {
         echo -e "  ${RED}✗${NC} Copy-on-write: not supported (filesystem: $fs_type)"
         echo -e "      Tasks will use full copies, which is slow for large repos."
         echo -e "      Consider: btrfs, XFS (reflink=1), or use git worktree instead."
-        ((issues++))
+        ((issues++)) || true
     fi
 
     # 2. Check parent directory writability
@@ -624,7 +649,7 @@ cmd_doctor() {
     else
         echo -e "  ${RED}✗${NC} Parent directory: not writable ($parent_dir)"
         echo -e "      git-task needs to create a sibling directory for tasks."
-        ((issues++))
+        ((issues++)) || true
     fi
 
     # 3. Check if we're in a git repo
@@ -642,12 +667,12 @@ cmd_doctor() {
             echo -e "  ${GREEN}✓${NC} Symlinks: supported"
         else
             echo -e "  ${RED}✗${NC} Symlinks: not following correctly"
-            ((issues++))
+            ((issues++)) || true
         fi
         rm -f "$test_link"
     else
         echo -e "  ${RED}✗${NC} Symlinks: creation failed"
-        ((issues++))
+        ((issues++)) || true
     fi
     rm -f "$test_target"
 
