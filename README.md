@@ -260,6 +260,60 @@ git task status
 | Linux (btrfs/xfs) | `cp --reflink=auto` | CoW if filesystem supports it |
 | Linux (ext4/other) | `cp -R` | Falls back to regular copy |
 
+### Linux / Ubuntu support
+
+git-task relies on copy-on-write (CoW) filesystem cloning to provide fast, disk-efficient task creation.
+
+On Linux, this means **your filesystem matters**.
+
+#### Recommended filesystems
+
+git-task works best on filesystems that support reflinks:
+
+- **Btrfs** - fully supported
+- **XFS** - must be created with `reflink=1`
+- **APFS** (macOS) - fully supported
+
+On these filesystems, tasks are created nearly instantly and unchanged files are physically shared until modified.
+
+#### ext4 and other non-CoW filesystems
+
+On ext4 (the default on many Ubuntu installs) and other non-CoW filesystems:
+
+- Tasks fall back to full directory copies
+- Disk usage grows linearly with each task
+- Task creation time scales with repository size
+
+git-task will still function correctly, but most performance and disk benefits are lost.
+**In these cases, `git worktree` may be a better choice.**
+
+#### How to check your filesystem
+
+```bash
+stat -f -c %T .
+```
+
+- `btrfs` → ideal
+- `xfs` → check reflink support
+- `ext2/ext3/ext4` → no CoW
+
+Or test reflinks directly:
+
+```bash
+cp --reflink=always file1 file2
+```
+
+If this fails, your filesystem does not support CoW cloning.
+
+#### Filesystem summary
+
+| Filesystem | Supported | Performance |
+|------------|-----------|-------------|
+| Btrfs | Yes | Excellent |
+| XFS (reflink=1) | Yes | Excellent |
+| ext4 | Functional | Slow (full copies) |
+| Others | Varies | Depends on reflink support |
+
 ## Limitations
 
 - Requires the repo's parent directory to be writable (for the `-tasks` directory)
