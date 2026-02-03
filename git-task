@@ -305,6 +305,51 @@ cmd_destroy() {
     log_success "Destroyed task: $task_name"
 }
 
+cmd_uninit() {
+    local force="${1:-}"
+    local base=$(get_base_repo)
+    local tasks_dir=$(get_tasks_dir)
+
+    [[ -d "$tasks_dir" ]] || die "Not initialized"
+
+    # Count tasks
+    local task_count=$(find "$tasks_dir" -maxdepth 1 -mindepth 1 -type d | wc -l | tr -d ' ')
+
+    if [[ "$force" != "--force" ]] && [[ "$force" != "-f" ]]; then
+        # Check for uncommitted changes in any task
+        for task_path in "$tasks_dir"/*/; do
+            [[ -d "$task_path" ]] || continue
+            cd "$task_path"
+            if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
+                die "Task '$(basename "$task_path")' has uncommitted changes. Use --force to uninit anyway."
+            fi
+        done
+
+        if [[ "$task_count" -gt 1 ]]; then
+            log_warn "You have $task_count tasks. Uninit will keep 'main' and delete others."
+            log_warn "Run with --force to confirm, or destroy other tasks first."
+            die "Aborted"
+        fi
+    fi
+
+    local main_task="$tasks_dir/main"
+    [[ -d "$main_task" ]] || die "No 'main' task found"
+
+    log_info "Restoring repo from 'main' task..."
+
+    # Remove symlink
+    rm -f "$base"
+
+    # Move main task back to original location
+    mv "$main_task" "$base"
+
+    # Remove tasks directory (and any other tasks)
+    rm -rf "$tasks_dir"
+
+    log_success "Restored repo to $base"
+    log_info "git-task has been removed from this repo"
+}
+
 cmd_push() {
     ensure_git_repo
 
@@ -361,6 +406,7 @@ ${YELLOW}USAGE${NC}
 
 ${YELLOW}COMMANDS${NC}
     init [path]              Initialize git-task for a repository
+    uninit [--force]         Remove git-task, restore normal repo
     new <branch> [...]       Create task(s) with branch name(s)
     switch <name>            Switch active task (update symlink)
     list                     List all tasks with status
@@ -409,6 +455,7 @@ main() {
 
     case "$cmd" in
         init)    cmd_init "$@" ;;
+        uninit)             cmd_uninit "$@" ;;
         new|create|add)     cmd_new "$@" ;;
         switch|checkout|sw) cmd_switch "$@" ;;
         list|ls)            cmd_list "$@" ;;
