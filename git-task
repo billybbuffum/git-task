@@ -143,53 +143,44 @@ cmd_init() {
 }
 
 cmd_new() {
-    local task_name="${1:-}"
-    local base_task="${2:-}"
-
-    [[ -n "$task_name" ]] || die "Usage: git task new <name> [base-task]"
-    [[ "$task_name" =~ ^[a-zA-Z0-9_-]+$ ]] || die "Task name must be alphanumeric with dashes/underscores"
+    [[ $# -gt 0 ]] || die "Usage: git task new <branch> [branch2] [branch3] ..."
 
     local base=$(get_base_repo)
     local tasks_dir=$(get_tasks_dir)
-    local new_task_path="$tasks_dir/$task_name"
-
     [[ -d "$tasks_dir" ]] || die "Not initialized. Run 'git task init' first."
-    [[ ! -d "$new_task_path" ]] || die "Task '$task_name' already exists"
 
-    # Determine source for clone
-    local source_path
-    if [[ -n "$base_task" ]]; then
-        source_path="$tasks_dir/$base_task"
-        [[ -d "$source_path" ]] || die "Base task '$base_task' does not exist"
-    else
-        # Use current task or main
-        local current=$(get_current_task || echo "main")
-        source_path="$tasks_dir/$current"
-    fi
+    # Get source for clones (current task or main)
+    local current=$(get_current_task || echo "main")
+    local source_path="$tasks_dir/$current"
 
-    log_info "Creating task '$task_name' from '$(basename "$source_path")'..."
+    for branch_name in "$@"; do
+        # Convert branch name to directory-safe task name (feature/foo -> feature-foo)
+        local task_name="${branch_name//\//-}"
+        local new_task_path="$tasks_dir/$task_name"
 
-    # CoW clone (APFS on macOS, reflink on Linux)
-    clone_cp "$source_path" "$new_task_path"
+        if [[ -d "$new_task_path" ]]; then
+            log_warn "Task '$task_name' already exists, skipping"
+            continue
+        fi
 
-    # Create and checkout new branch
-    cd "$new_task_path"
-    local branch_name="task/$task_name"
+        log_info "Creating task '$task_name' from '$(basename "$source_path")'..."
 
-    if git show-ref --verify --quiet "refs/heads/$branch_name"; then
-        git checkout "$branch_name"
-        log_info "Checked out existing branch: $branch_name"
-    else
-        git checkout -b "$branch_name"
-        log_success "Created branch: $branch_name"
-    fi
+        # CoW clone (APFS on macOS, reflink on Linux)
+        clone_cp "$source_path" "$new_task_path"
 
-    log_success "Created task: $task_name"
-    log_info "  Path:   $new_task_path"
-    log_info "  Branch: $branch_name"
-    echo ""
-    log_info "Switch to it with: git task switch $task_name"
-    log_info "Or work directly in: $new_task_path"
+        # Create and checkout branch
+        cd "$new_task_path"
+
+        if git show-ref --verify --quiet "refs/heads/$branch_name"; then
+            git checkout "$branch_name"
+            log_info "Checked out existing branch: $branch_name"
+        else
+            git checkout -b "$branch_name"
+            log_success "Created branch: $branch_name"
+        fi
+
+        log_success "Created task: $task_name [$branch_name]"
+    done
 }
 
 cmd_switch() {
@@ -370,7 +361,7 @@ ${YELLOW}USAGE${NC}
 
 ${YELLOW}COMMANDS${NC}
     init [path]              Initialize git-task for a repository
-    new <name> [base]        Create a new task (APFS clone)
+    new <branch> [...]       Create task(s) with branch name(s)
     switch <name>            Switch active task (update symlink)
     list                     List all tasks with status
     status                   Show git-task status
@@ -385,7 +376,7 @@ ${YELLOW}EXAMPLES${NC}
     git task init
 
     # Create a new task for a feature
-    git task new auth-refactor
+    git task new feature/auth-refactor
 
     # Work on it in your IDE (via symlink)
     git task switch auth-refactor
