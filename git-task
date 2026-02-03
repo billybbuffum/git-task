@@ -592,6 +592,95 @@ cmd_exec() {
     exec "$@"
 }
 
+cmd_doctor() {
+    echo -e "${CYAN}git-task doctor${NC}"
+    echo ""
+    echo "Checking environment..."
+    echo ""
+
+    local issues=0
+
+    # 1. Check CoW/reflink support
+    COW_MODE=""  # Reset to force fresh detection
+    detect_cow_support "."
+
+    if [[ "$COW_MODE" == "cow" ]]; then
+        echo -e "  ${GREEN}✓${NC} Copy-on-write: supported"
+    else
+        local fs_type=""
+        if command -v stat &>/dev/null; then
+            fs_type=$(stat -f -c %T . 2>/dev/null || echo "unknown")
+        fi
+        echo -e "  ${RED}✗${NC} Copy-on-write: not supported (filesystem: $fs_type)"
+        echo -e "      Tasks will use full copies, which is slow for large repos."
+        echo -e "      Consider: btrfs, XFS (reflink=1), or use git worktree instead."
+        ((issues++))
+    fi
+
+    # 2. Check parent directory writability
+    local parent_dir=$(dirname "$(pwd)")
+    if [[ -w "$parent_dir" ]]; then
+        echo -e "  ${GREEN}✓${NC} Parent directory: writable"
+    else
+        echo -e "  ${RED}✗${NC} Parent directory: not writable ($parent_dir)"
+        echo -e "      git-task needs to create a sibling directory for tasks."
+        ((issues++))
+    fi
+
+    # 3. Check if we're in a git repo
+    if git rev-parse --git-dir > /dev/null 2>&1; then
+        echo -e "  ${GREEN}✓${NC} Git repository: yes"
+    else
+        echo -e "  ${YELLOW}!${NC} Git repository: no (run from a git repo to initialize)"
+    fi
+
+    # 4. Check symlink support
+    local test_link=$(mktemp -u)
+    local test_target=$(mktemp)
+    if ln -s "$test_target" "$test_link" 2>/dev/null; then
+        if [[ -L "$test_link" ]] && [[ -e "$test_link" ]]; then
+            echo -e "  ${GREEN}✓${NC} Symlinks: supported"
+        else
+            echo -e "  ${RED}✗${NC} Symlinks: not following correctly"
+            ((issues++))
+        fi
+        rm -f "$test_link"
+    else
+        echo -e "  ${RED}✗${NC} Symlinks: creation failed"
+        ((issues++))
+    fi
+    rm -f "$test_target"
+
+    # 5. Check common tools that may have symlink issues
+    echo ""
+    echo "Tooling notes:"
+
+    # Docker check
+    if command -v docker &>/dev/null; then
+        echo -e "  ${YELLOW}!${NC} Docker detected: volume mounts may not follow symlinks."
+        echo -e "      Use \$(git task path <name>) for absolute paths in -v flags."
+    fi
+
+    # VS Code check
+    if command -v code &>/dev/null; then
+        echo -e "  ${BLUE}→${NC} VS Code detected: works well with symlinks."
+        echo -e "      Open the symlinked path, not the tasks directory directly."
+    fi
+
+    echo ""
+
+    # Summary
+    if [[ $issues -eq 0 ]]; then
+        echo -e "${GREEN}Environment looks good!${NC}"
+        if [[ "$COW_MODE" == "cow" ]]; then
+            echo "You'll get fast, space-efficient CoW clones."
+        fi
+    else
+        echo -e "${YELLOW}Found $issues issue(s).${NC}"
+        echo "git-task may still work, but with degraded performance or limitations."
+    fi
+}
+
 cmd_help() {
     cat << EOF
 ${CYAN}git-task${NC} v${VERSION} - APFS clone-based git workflow manager
@@ -613,6 +702,7 @@ ${YELLOW}COMMANDS${NC}
     sync                     Rebase all tasks onto latest origin/main
     path [name]              Print path to task directory
     exec <name> <cmd...>     Run command in task directory
+    doctor                   Check environment for potential issues
     help                     Show this help
 
 ${YELLOW}EXAMPLES${NC}
@@ -665,6 +755,7 @@ main() {
         sync)               cmd_sync "$@" ;;
         path)               cmd_path "$@" ;;
         exec|run)           cmd_exec "$@" ;;
+        doctor)             cmd_doctor "$@" ;;
         help|--help|-h)     cmd_help ;;
         version|--version|-v) echo "git-task v${VERSION}" ;;
         *)                  die "Unknown command: $cmd. Run 'git task help' for usage." ;;

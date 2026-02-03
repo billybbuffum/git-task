@@ -128,9 +128,16 @@ export PATH="$PATH:$(pwd)/git-task"
 cp git-task/git-task /usr/local/bin/
 ```
 
+## Before You Start
+
+> **Linux users:** git-task's speed and disk efficiency depend on your filesystem supporting copy-on-write (reflinks). On ext4 (Ubuntu's default), tasks fall back to full copies—slow and disk-heavy for large repos. Run `git task doctor` to check, or see [Platform Support](#platform-support) for details.
+
 ## Quick Start
 
 ```bash
+# Check your environment first
+git task doctor
+
 # Initialize in your repo
 cd my-project
 git task init
@@ -191,6 +198,7 @@ Each task directory is a full git repo with its own branch, so you can:
 | `git task push` | Push current task's branch |
 | `git task path [name]` | Print path to task directory |
 | `git task exec <name> <cmd>` | Run command in a task's directory |
+| `git task doctor` | Check environment for potential issues |
 
 ## Usage Patterns
 
@@ -316,9 +324,58 @@ If this fails, your filesystem does not support CoW cloning.
 
 ## Limitations
 
-- Requires the repo's parent directory to be writable (for the `-tasks` directory)
-- The original repo path becomes a symlink (some tools may not follow symlinks)
-- Each task has independent git state (remotes, config) - changes to one don't affect others
+### Parent directory must be writable
+
+git-task creates a sibling directory (`my-repo-tasks/`) next to your repo. If the parent directory isn't writable, initialization will fail.
+
+### Symlink compatibility
+
+The original repo path becomes a symlink. Most tools handle this fine, but some don't:
+
+**Docker volume mounts** don't follow symlinks by default:
+```bash
+# Won't work - Docker sees the symlink, not the target
+docker run -v $(pwd):/app myimage
+
+# Works - use the resolved path
+docker run -v $(git task path):/app myimage
+```
+
+**Some build tools** (Bazel, Pants) may have issues with symlinked workspaces. Their caches often key on absolute paths, which can cause confusion when the symlink target changes.
+
+**File watchers** in some tools may not detect changes through symlinks. If hot-reload stops working, check if your tool needs to be pointed at the physical path.
+
+### Independent git state
+
+Each task is a full git clone with its own:
+- Remote configuration
+- Git config (user, hooks, etc.)
+- Branch state
+
+Changes to git config in one task don't propagate to others. If you add a new remote or change a hook, you'll need to do it in each task.
+
+### Validate your setup
+
+Run `git task doctor` to check for potential issues before you start:
+
+```
+$ git task doctor
+git-task doctor
+
+Checking environment...
+
+  ✓ Copy-on-write: supported
+  ✓ Parent directory: writable
+  ✓ Git repository: yes
+  ✓ Symlinks: supported
+
+Tooling notes:
+  ! Docker detected: volume mounts may not follow symlinks.
+      Use $(git task path <name>) for absolute paths in -v flags.
+
+Environment looks good!
+You'll get fast, space-efficient CoW clones.
+```
 
 ## License
 
