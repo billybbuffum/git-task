@@ -24,7 +24,6 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 # Configuration
-CONFIG_FILE="$HOME/.git-task"
 TASKS_SUFFIX="-tasks"
 
 #######################################
@@ -117,20 +116,24 @@ cmd_init() {
     # Create base task from current state
     log_info "Creating 'main' task from current repo..."
 
-    # Move repo to tasks dir
+    # Clone repo to tasks dir
     local main_task="$tasks_dir/main"
     clone_cp "$repo_path" "$main_task"  # CoW clone (APFS on macOS, reflink on Linux)
 
-    # Clear original and make symlink
-    local repo_name=$(basename "$repo_path")
-    local parent_dir=$(dirname "$repo_path")
-
-    # Remove contents of original (keeping tasks dir reference)
-    find "$repo_path" -mindepth 1 -maxdepth 1 ! -name "*${TASKS_SUFFIX}" -exec rm -rf {} +
+    # Verify clone succeeded before removing original
+    if [[ ! -d "$main_task/.git" ]]; then
+        rm -rf "$tasks_dir"
+        die "Clone failed - aborting init"
+    fi
 
     # Convert original to symlink
     rm -rf "$repo_path"
     ln -s "$main_task" "$repo_path"
+
+    # Verify symlink works
+    if [[ ! -d "$repo_path/.git" ]]; then
+        die "Symlink creation failed - repo is at $main_task"
+    fi
 
     log_success "Created 'main' task and linked $repo_path → $main_task"
     echo ""
